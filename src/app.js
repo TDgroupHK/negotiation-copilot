@@ -29,7 +29,7 @@ const settings = Object.assign(
   {
     provider: "zhipu", // "zhipu" (free GLM) | "anthropic" (Claude API)
     zhipuKey: "",
-    zhipuModel: "glm-4.7-flash",
+    zhipuModel: "glm-4-flash-250414",
     asr: "doubao", // speech-to-text: "doubao" | "siliconflow" (free) | "zhipu" (paid) | "browser" (phone built-in)
     dbAppId: "",
     dbToken: "",
@@ -52,6 +52,12 @@ if (LS.get("settingsVersion", 1) < 2) {
   if (settings.minChars === 12) settings.minChars = 4;
   LS.set("settings", settings);
   LS.set("settingsVersion", 2);
+}
+// v3: the faster GLM-4-Flash becomes the default for advice
+if (LS.get("settingsVersion", 1) < 3) {
+  if (settings.zhipuModel === "glm-4.7-flash") settings.zhipuModel = "glm-4-flash-250414";
+  LS.set("settings", settings);
+  LS.set("settingsVersion", 3);
 }
 
 const state = {
@@ -88,8 +94,8 @@ const hasKey = () =>
   settings.provider === "zhipu" ? !!settings.zhipuKey : !!(settings.apiKey || settings.baseURL.trim());
 
 const ZHIPU_MODELS = {
-  "glm-4.7-flash": "GLM-4.7-Flash（免费，推荐）",
-  "glm-4-flash-250414": "GLM-4-Flash（免费，更快）",
+  "glm-4-flash-250414": "GLM-4-Flash（免费，最快，推荐）",
+  "glm-4.7-flash": "GLM-4.7-Flash（免费，更聪明但较慢）",
 };
 
 function client() {
@@ -191,14 +197,16 @@ function parseAdvice(text, manual) {
 
 // Zhipu GLM (OpenAI-style chat completions, SSE stream). Its API allows browser (CORS) calls.
 async function runZhipu(manual, signal, onText) {
+  const zmodel = settings.zhipuModel in ZHIPU_MODELS ? settings.zhipuModel : "glm-4-flash-250414";
   const res = await fetch("https://open.bigmodel.cn/api/paas/v4/chat/completions", {
     method: "POST",
     signal,
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + settings.zhipuKey },
     body: JSON.stringify({
-      model: settings.zhipuModel in ZHIPU_MODELS ? settings.zhipuModel : "glm-4.7-flash",
+      model: zmodel,
       stream: true,
-      thinking: { type: manual ? "enabled" : "disabled" },
+      // only GLM-4.7-Flash has a thinking switch; GLM-4-Flash never thinks
+      ...(zmodel === "glm-4.7-flash" ? { thinking: { type: manual ? "enabled" : "disabled" } } : {}),
       max_tokens: manual ? 4000 : 150,
       temperature: 0.3,
       messages: [
