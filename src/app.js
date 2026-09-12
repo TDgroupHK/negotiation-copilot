@@ -425,10 +425,15 @@ const activeAsr = () => (ASR[settings.asr]?.key() ? settings.asr : "browser");
 let recorder = null;
 let asrChain = Promise.resolve();
 let asrFailed = false;
+let asrBusy = 0;
 
 function transcribeLater(blob) {
   // one request at a time keeps sentences in order
-  asrChain = asrChain.then(() => transcribe(blob)).catch(() => {});
+  asrBusy++;
+  asrChain = asrChain
+    .then(() => transcribe(blob))
+    .catch(() => {})
+    .finally(() => asrBusy--);
 }
 
 const blobToBase64 = (blob) =>
@@ -557,12 +562,29 @@ async function startCloudListening() {
   primeSpeech();
   keepAwake();
   renderStatus();
-  recorder = new SegmentRecorder({
+  let lastLevel = 0;
+  const rec = new SegmentRecorder({
     onSegment: transcribeLater,
-    onState: (s) => state.listening && s === "speaking" && renderLive("正在听…"),
+    onLevel: (rms, speaking) => {
+      if (!state.listening || recorder !== rec) return;
+      lastLevel = Date.now();
+      // a small meter so it's obvious the phone is hearing something
+      const bars = "▁▂▃▄▅▆▇█";
+      const n = Math.max(0, Math.min(7, Math.round(Math.log10(Math.max(rms, 1e-4) / 1e-3) * 3.5)));
+      const meter = bars.slice(0, n + 1);
+      const last = state.transcript.slice(-1)[0]?.text || "";
+      renderLive(`${asrBusy ? "识别中" : speaking ? "正在听" : "在听"} ${meter}${last ? "　" + last : ""}`);
+    },
   });
+  recorder = rec;
   try {
-    await recorder.start();
+    await rec.start(); // called synchronously from the tap (see recorder.js)
+    // if no audio arrives at all, the microphone is not really running
+    setTimeout(() => {
+      if (state.listening && recorder === rec && !lastLevel) {
+        showNotice(`收不到麦克风声音（音频状态：${rec.ctx?.state || "无"}）。请点「暂停」再点「继续监听」；还不行就刷新页面`);
+      }
+    }, 4000);
   } catch (err) {
     recorder = null;
     stopListening();

@@ -5,27 +5,37 @@ const RATE = 16000;
 const FRAME = 320; // 20 ms at 16 kHz
 
 export class SegmentRecorder {
-  constructor({ onSegment, onState, silenceMs = 700, maxMs = 25000, minSpeechMs = 400, prerollMs = 300 }) {
+  constructor({ onSegment, onState, onLevel, silenceMs = 700, maxMs = 25000, minSpeechMs = 400, prerollMs = 300 }) {
     this.onSegment = onSegment;
     this.onState = onState || (() => {});
+    this.onLevel = onLevel || (() => {});
+    this.frames = 0;
     this.silenceFrames = silenceMs / 20;
     this.maxFrames = maxMs / 20;
     this.minSpeechFrames = minSpeechMs / 20;
     this.prerollFrames = prerollMs / 20;
   }
 
-  async start() {
+  // Must be called straight from a tap: iOS only lets an AudioContext run if it is
+  // created and resumed inside the user gesture, before anything is awaited.
+  start() {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    this.ctx = new Ctx();
+    const resumed = this.ctx.resume().catch(() => {});
+    return this.open(resumed);
+  }
+
+  async open(resumed) {
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    this.ctx = new Ctx();
-    await this.ctx.resume();
+    await resumed;
+    if (this.ctx.state !== "running") await this.ctx.resume().catch(() => {});
     this.ratio = this.ctx.sampleRate / RATE;
     this.srcPos = 0; // fractional read position for resampling
     this.pending = new Float32Array(0); // resampled samples not yet framed
 
-    this.noise = 0.01;
+    this.noise = 0.005;
     this.preroll = [];
     this.segment = null; // {frames: [], loud: n, quiet: n}
     this.loudRun = 0;
@@ -73,8 +83,9 @@ export class SegmentRecorder {
     let sum = 0;
     for (let i = 0; i < f.length; i++) sum += f[i] * f[i];
     const rms = Math.sqrt(sum / f.length);
-    const threshold = Math.max(this.noise * 2.5, 0.004);
+    const threshold = Math.max(this.noise * 2.2, 0.003);
     const loud = rms > threshold;
+    if (++this.frames % 10 === 0) this.onLevel(rms, !!this.segment); // ~5 times a second
 
     if (!this.segment) {
       // track the background noise level only while nobody is talking
