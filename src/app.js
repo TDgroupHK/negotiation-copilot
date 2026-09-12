@@ -156,9 +156,10 @@ ${ctx || "（用户没有填写背景，请根据对话本身判断）"}
     `
 
 输出规则：
-- 每次有新内容都要主动给用户一条当下最有用的提示：对方话里的信号、该追问什么、下一步怎么说。和之前的提醒意思相同时，换成推进一步的建议，不要重复。
-- 只有最新内容完全没有信息（只是"嗯""喂""好的"之类，或识别出的是杂音）时，才只输出：PASS
-- 输出 1~2 行，不要写其他任何内容：
+- 只在出现关键内容时才提醒，例如：对方报价或说出关键数字；让步、拒绝或松口；施压（截止期限、竞争对手、"领导不同意"等）；前后矛盾；需要用户马上回应的关键问题；用户自己可能让步太快、说漏底线。
+- 寒暄、闲聊、铺垫、客套、重复的话、信息量低的话，或者和你之前的提醒意思相同，一律只输出：PASS
+- 宁可少提醒，也不要频繁打扰用户。
+- 需要提醒时，输出 1~2 行，不要写其他任何内容：
 第 1 行：【类型】建议。类型只能是 警惕 / 机会 / 追问 / 策略 之一，建议不超过 20 字。
 第 2 行（可选）：说：「用户可以直接说的一句话，不超过 30 字」`
   );
@@ -458,7 +459,7 @@ function scheduleAnalyze(delay = 700) {
     // don't wait for the sentence to finish: react once enough of it has been said
     const seen = state.livePartial.startsWith(state.partialAnalyzed) ? state.partialAnalyzed.length : 0;
     const partialGrowth = state.livePartial.length - seen;
-    if (chars >= settings.minChars || fresh.some((e) => e.manual) || partialGrowth >= 10) analyze(false);
+    if (chars >= settings.minChars || fresh.some((e) => e.manual) || partialGrowth >= 16) analyze(false);
   }, delay);
 }
 
@@ -1009,14 +1010,29 @@ function agoText(at) {
   return s < 5 ? "刚刚" : s < 60 ? `${s} 秒前` : `${Math.floor(s / 60)} 分钟前`;
 }
 
+function adviceItem(a) {
+  const li = document.createElement("li");
+  li.className = KIND_CLASS[a.kind] || "plan";
+  const k = document.createElement("b");
+  k.textContent = a.kind;
+  const t = document.createElement("span");
+  t.textContent = a.text.split("\n")[0] + (a.say ? `  「${a.say}」` : "");
+  const w = document.createElement("time");
+  w.textContent = agoText(a.at);
+  li.append(k, t, w);
+  return li;
+}
+
 function renderHistory() {
-  // older advice stays folded away; only the newest one is on the card
-  const older = Math.max(0, state.advice.length - 1);
+  // newest advice is on the card; the two before it stay visible right below it,
+  // anything older is folded away
+  $("#recent").replaceChildren(...state.advice.slice(1, 3).map(adviceItem));
+  const older = Math.max(0, state.advice.length - 3);
   $("#historyBox").hidden = !older;
   $("#hcount").textContent = older ? `（${older} 条）` : "";
   const ol = $("#history");
   ol.replaceChildren(
-    ...state.advice.slice(1, 12).map((a) => {
+    ...state.advice.slice(3, 20).map((a) => {
       const li = document.createElement("li");
       li.className = KIND_CLASS[a.kind] || "plan";
       const k = document.createElement("b");

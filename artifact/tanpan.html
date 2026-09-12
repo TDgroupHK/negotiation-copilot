@@ -76,15 +76,19 @@
 
   .history { margin: 10px 0 16px; }
   .history summary { cursor: pointer; color: var(--dim); font-size: 14px; padding: 6px 2px; }
-  .history ol { list-style: none; padding: 0; margin: 4px 0 0; }
-  .history li {
+  .history ol, .recent { list-style: none; padding: 0; margin: 4px 0 0; }
+  .recent:empty { display: none; }
+  .recent li { font-size: 17px; }
+  .recent li span { color: var(--paper); }
+  .history li, .recent li {
     display: grid; grid-template-columns: 3.2em 1fr auto; gap: 10px; align-items: baseline;
     padding: 9px 2px; border-bottom: 1px solid var(--line); font-size: 15px;
   }
-  .history li b { font-size: 12px; font-weight: 600; letter-spacing: .1em; }
-  .history li.warn b { color: var(--warn); } .history li.good b { color: var(--good); } .history li.ask b { color: var(--ask); }
-  .history li.plan b { color: var(--plan); } .history li.big b { color: var(--big); }
-  .history time { color: var(--dim); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .history li b, .recent li b { font-size: 12px; font-weight: 600; letter-spacing: .1em; }
+  .history li.warn b, .recent li.warn b { color: var(--warn); } .history li.good b, .recent li.good b { color: var(--good); }
+  .history li.ask b, .recent li.ask b { color: var(--ask); }
+  .history li.plan b, .recent li.plan b { color: var(--plan); } .history li.big b, .recent li.big b { color: var(--big); }
+  .history time, .recent time { color: var(--dim); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 
   .card.fresh { animation: fresh 1.2s ease-out; }
   @keyframes fresh { 0% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 70%, transparent); } 100% { box-shadow: 0 0 0 0 transparent; } }
@@ -165,6 +169,7 @@
     <textarea id="dictArea" rows="3" placeholder="点这里，再点键盘上的 🎤 麦克风开始听写。听到的话会自动交给 Claude 分析" autocomplete="off" spellcheck="false" aria-label="键盘听写"></textarea>
     <div class="dict-row"><span>听写停了就再点一次 🎤</span><button id="dictDone" type="button" class="link">收起键盘</button></div>
   </section>
+  <ol id="recent" class="recent" aria-label="刚才的提醒"></ol>
   <div id="live" class="live"></div>
   <section id="captions" class="captions empty" aria-live="polite">
     <div class="cap-head"><span>实时字幕</span><span id="tcount"></span></div>
