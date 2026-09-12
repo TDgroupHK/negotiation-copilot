@@ -8,6 +8,7 @@ export class SegmentRecorder {
   constructor({
     onSegment,
     onPartial, // (wavBlob, seconds) every partialMs while someone is talking, for live captions
+    onPcm,
     onState,
     onLevel,
     silenceMs = 500,
@@ -19,6 +20,7 @@ export class SegmentRecorder {
   }) {
     this.onSegment = onSegment;
     this.onPartial = onPartial;
+    this.onPcm = onPcm; // (float32 20 ms frame at 16 kHz) — raw audio for streaming recognition
     this.onState = onState || (() => {});
     this.onLevel = onLevel || (() => {});
     this.partialFrames = partialMs / 20;
@@ -101,6 +103,7 @@ export class SegmentRecorder {
     for (let i = 0; i < f.length; i++) sum += f[i] * f[i];
     const rms = Math.sqrt(sum / f.length);
     if (!Number.isFinite(rms)) return; // never let one bad frame poison the levels
+    this.onPcm?.(f);
 
     // Background level = the quietest moment of the last ~2 s. iOS boosts room noise
     // (auto gain), so a fixed threshold never sees a pause; this follows it instead.

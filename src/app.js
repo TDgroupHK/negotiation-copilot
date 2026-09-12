@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { SegmentRecorder } from "./recorder.js";
+import { DoubaoStream } from "./stream-asr.js";
 
 // ---------- storage ----------
 const LS = {
@@ -156,7 +157,7 @@ function userContent(manual) {
 
   // keep the prompt small: last ~3500 chars of earlier conversation
   let olderText = older.map(line).join("\n");
-  if (olderText.length > 3500) olderText = "…" + olderText.slice(-3500);
+  if (olderText.length > 1500) olderText = "…" + olderText.slice(-1500); // shorter prompt = faster answer
 
   const prev = state.advice
     .slice(0, 6)
@@ -198,7 +199,7 @@ async function runZhipu(manual, signal, onText) {
       model: settings.zhipuModel in ZHIPU_MODELS ? settings.zhipuModel : "glm-4.7-flash",
       stream: true,
       thinking: { type: manual ? "enabled" : "disabled" },
-      max_tokens: manual ? 4000 : 400,
+      max_tokens: manual ? 4000 : 150,
       temperature: 0.3,
       messages: [
         { role: "system", content: systemPrompt(manual) },
@@ -297,7 +298,7 @@ async function analyze(manual = false) {
   if (!manual) {
     if (state.transcript.length === state.analyzedCount) return;
     if (Date.now() < state.autoPausedUntil) return;
-    const wait = state.lastAutoAt + (usingAccount() ? 6000 : 2500) - Date.now();
+    const wait = state.lastAutoAt + (usingAccount() ? 6000 : 1000) - Date.now();
     if (wait > 0) return scheduleAnalyze(wait);
   }
 
@@ -415,6 +416,10 @@ function scheduleAnalyze(delay = 700) {
 // The page records each utterance itself (recorder.js) and sends it as a WAV to a
 // transcription API — far more accurate than the phone's built-in web recognition.
 const ASR = {
+  "doubao-stream": {
+    name: "豆包流式",
+    key: () => settings.dbAppId && settings.dbToken,
+  },
   doubao: {
     name: "豆包语音",
     url: "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",
@@ -608,6 +613,48 @@ async function transcribe(blob) {
   else if (state.listening) renderLive("");
 }
 
+// ---------- Doubao streaming ----------
+let stream = null;
+let streamErrors = [];
+
+function joinFloat(chunks) {
+  const out = new Float32Array(chunks.reduce((n, c) => n + c.length, 0));
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.length;
+  }
+  return out;
+}
+
+function openStream() {
+  const s = new DoubaoStream({
+    appId: settings.dbAppId,
+    token: settings.dbToken,
+    resourceId: "volc.bigasr.sauc.duration",
+    onPartial: (t) => stream === s && renderPartial(t ? t + " …" : ""),
+    onFinal: (t) => stream === s && commit(t),
+    onError: (code, msg) => {
+      if (stream !== s) return;
+      const now = Date.now();
+      streamErrors = streamErrors.filter((t) => now - t < 20000).concat(now);
+      if (/grant not found|45000010|access key|app key/i.test(`${code} ${msg}`) || streamErrors.length >= 3) {
+        asrFailed = true;
+        stopListening();
+        showNotice(`豆包流式识别连不上（${code}）：${String(msg).slice(0, 80)}。请检查 APP ID / Access Token，以及控制台里「流式语音识别大模型」是否已开通试用`);
+      } else {
+        showNotice(`豆包流式识别出错（${code}）：${String(msg).slice(0, 80)}`);
+      }
+    },
+    onClose: () => {
+      // the server ends sessions now and then; keep listening with a fresh one
+      if (stream === s && state.listening && !asrFailed) setTimeout(() => stream === s && state.listening && openStream(), 300);
+    },
+  });
+  stream = s;
+  s.start();
+}
+
 async function startCloudListening() {
   asrFailed = false;
   state.listening = true;
@@ -616,9 +663,21 @@ async function startCloudListening() {
   keepAwake();
   renderStatus();
   let lastLevel = 0;
+  const streaming = activeAsr() === "doubao-stream";
+  let pcmBuf = [];
   const rec = new SegmentRecorder({
-    onSegment: transcribeLater,
-    onPartial: previewPartial,
+    // streaming: the server finds sentence ends itself, so only raw audio is needed here
+    onSegment: streaming ? () => {} : transcribeLater,
+    onPartial: streaming ? undefined : previewPartial,
+    onPcm: streaming
+      ? (f) => {
+          pcmBuf.push(f);
+          if (pcmBuf.length >= 5) {
+            stream?.sendPcm(joinFloat(pcmBuf)); // 100 ms per packet
+            pcmBuf = [];
+          }
+        }
+      : undefined,
     onLevel: (rms, speakingSec) => {
       const speaking = speakingSec > 0;
       if (!state.listening || recorder !== rec) return;
@@ -632,6 +691,10 @@ async function startCloudListening() {
     },
   });
   recorder = rec;
+  if (streaming) {
+    streamErrors = [];
+    openStream();
+  }
   try {
     await rec.start(); // called synchronously from the tap (see recorder.js)
     // if no audio arrives at all, the microphone is not really running
@@ -665,7 +728,7 @@ function commit(text, manual = false) {
   LS.set("transcript", state.transcript.slice(-400));
   renderPartial("");
   renderTranscript();
-  scheduleAnalyze(manual ? 0 : 300);
+  scheduleAnalyze(0);
 }
 
 function startRecognizer() {
@@ -790,6 +853,10 @@ function stopListening() {
   const r = recorder;
   recorder = null;
   r?.stop(); // hands over the sentence in progress
+  const st = stream;
+  stream = null;
+  st?.stop();
+  renderPartial("");
   wakeLock?.release?.().catch(() => {});
   wakeLock = null;
   renderLive("");
@@ -960,7 +1027,7 @@ function applyBackendUI() {
       (el.classList.contains("p-anthropic") && prov !== "anthropic");
   });
   const asr = $("#fAsr").value || settings.asr;
-  document.querySelectorAll(".asr-db").forEach((el) => (el.hidden = asr !== "doubao"));
+  document.querySelectorAll(".asr-db").forEach((el) => (el.hidden = asr !== "doubao" && asr !== "doubao-stream"));
   document.querySelectorAll(".asr-sf").forEach((el) => (el.hidden = asr !== "siliconflow"));
   document.querySelectorAll(".asr-zhipu").forEach((el) => (el.hidden = asr !== "zhipu"));
   document.querySelectorAll(".asr-browser").forEach((el) => (el.hidden = asr !== "browser"));
