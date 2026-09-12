@@ -33,6 +33,7 @@ const settings = Object.assign(
     dbAppId: "",
     dbToken: "",
     sfKey: "",
+    sfModel: "FunAudioLLM/SenseVoiceSmall",
     apiKey: "",
     baseURL: "",
     model: "claude-opus-5",
@@ -420,9 +421,11 @@ const ASR = {
     key: () => settings.dbAppId && settings.dbToken,
   },
   siliconflow: {
-    name: "硅基流动 SenseVoice",
+    name: "硅基流动",
     url: "https://api.siliconflow.cn/v1/audio/transcriptions",
-    model: "FunAudioLLM/SenseVoiceSmall",
+    get model() {
+      return settings.sfModel || "FunAudioLLM/SenseVoiceSmall";
+    },
     key: () => settings.sfKey,
   },
   zhipu: {
@@ -478,8 +481,14 @@ async function recognizeQuietly(blob) {
   const res = await fetch(p.url, { method: "POST", headers: { Authorization: "Bearer " + p.key() }, body: fd });
   if (!res.ok) return "";
   const json = await res.json().catch(() => ({}));
-  return String(json.text || "")
+  return cleanAsrText(json.text);
+}
+
+// SenseVoice can add tags like <|zh|><|NEUTRAL|> and emotion/event emoji; keep only the words
+function cleanAsrText(t) {
+  return String(t || "")
     .replace(/<\|[^|]*\|>/g, "")
+    .replace(/\p{Extended_Pictographic}/gu, "")
     .trim();
 }
 
@@ -594,10 +603,7 @@ async function transcribe(blob) {
     return;
   }
   const json = await res.json().catch(() => ({}));
-  // SenseVoice can prefix tags like <|zh|><|NEUTRAL|>; drop them
-  const text = String(json.text || "")
-    .replace(/<\|[^|]*\|>/g, "")
-    .trim();
+  const text = cleanAsrText(json.text);
   if (text) commit(text);
   else if (state.listening) renderLive("");
 }
@@ -985,6 +991,7 @@ function openSheet(id) {
     $("#fZModel").value = settings.zhipuModel;
     $("#fAsr").value = settings.asr;
     $("#fSfKey").value = settings.sfKey;
+    $("#fSfModel").value = settings.sfModel;
     $("#fDbAppId").value = settings.dbAppId;
     $("#fDbToken").value = settings.dbToken;
     applyBackendUI();
@@ -1046,6 +1053,7 @@ function init() {
     settings.zhipuModel = $("#fZModel").value;
     settings.asr = $("#fAsr").value;
     settings.sfKey = $("#fSfKey").value.trim();
+    settings.sfModel = $("#fSfModel").value;
     settings.dbAppId = $("#fDbAppId").value.trim();
     settings.dbToken = $("#fDbToken").value.trim();
     asrFailed = false;

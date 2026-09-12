@@ -226,7 +226,7 @@
     <label class="field api-only"><span>语音识别</span>
       <select id="fAsr">
         <option value="doubao">豆包语音（最准，火山引擎）</option>
-        <option value="siliconflow">硅基流动 SenseVoice（免费，准确）</option>
+        <option value="siliconflow">硅基流动（免费，准确）</option>
         <option value="zhipu">智谱 GLM-ASR（最准，约 0.06 元/分钟，需充值）</option>
         <option value="browser">手机自带（免费，准确率低）</option>
       </select></label>
@@ -236,6 +236,12 @@
       <input id="fDbToken" type="password" placeholder="粘贴 Access Token" autocapitalize="off" spellcheck="false"></label>
     <label class="field api-only asr-sf"><span>硅基流动 API Key（在 cloud.siliconflow.cn 的「API 密钥」页面复制）</span>
       <input id="fSfKey" type="password" placeholder="sk-..." autocapitalize="off" spellcheck="false"></label>
+    <label class="field api-only asr-sf"><span>硅基流动识别模型（都免费，可以换着试哪个最准）</span>
+      <select id="fSfModel">
+        <option value="FunAudioLLM/SenseVoiceSmall">SenseVoice（阿里，速度最快）</option>
+        <option value="Qwen/Qwen3-ASR-1.7B">Qwen3-ASR（通义，新一代）</option>
+        <option value="XingChenAGI/XingChenASR-V3.2-Ultra">星辰 ASR Ultra（中国电信，会议/方言）</option>
+      </select></label>
     <p class="hint api-only asr-zhipu">使用上面填写的智谱 API Key，按录音时长计费。</p>
     <label class="field asr-browser"><span>识别语言</span>
       <select id="fLang">
