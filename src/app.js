@@ -38,12 +38,19 @@ const settings = Object.assign(
     model: "claude-opus-5",
     effort: "low",
     lang: "zh-CN",
-    minChars: 12,
+    minChars: 4,
     speak: false,
   },
   LS.get("settings", {}),
 );
 const prep = Object.assign({ me: "", goal: "", them: "", notes: "" }, LS.get("prep", {}));
+
+// v2: advice should follow every caption, so drop the old 12-character wait
+if (LS.get("settingsVersion", 1) < 2) {
+  if (settings.minChars === 12) settings.minChars = 4;
+  LS.set("settings", settings);
+  LS.set("settingsVersion", 2);
+}
 
 const state = {
   listening: false,
@@ -127,8 +134,9 @@ ${ctx || "（用户没有填写背景，请根据对话本身判断）"}
     `
 
 输出规则：
-- 如果最新内容没有值得提醒的（寒暄、闲聊、信息量低，或者和你之前的提醒重复），只输出：PASS
-- 否则输出 1~2 行，不要写其他任何内容：
+- 每次有新内容都要主动给用户一条当下最有用的提示：对方话里的信号、该追问什么、下一步怎么说。和之前的提醒意思相同时，换成推进一步的建议，不要重复。
+- 只有最新内容完全没有信息（只是"嗯""喂""好的"之类，或识别出的是杂音）时，才只输出：PASS
+- 输出 1~2 行，不要写其他任何内容：
 第 1 行：【类型】建议。类型只能是 警惕 / 机会 / 追问 / 策略 之一，建议不超过 20 字。
 第 2 行（可选）：说：「用户可以直接说的一句话，不超过 30 字」`
   );
@@ -325,6 +333,10 @@ async function analyze(manual = false) {
       state.advice = state.advice.slice(0, 50);
       LS.set("advice", state.advice);
       renderCard(item);
+      const card = $("#card");
+      card.classList.remove("fresh");
+      void card.offsetWidth; // restart the highlight animation
+      card.classList.add("fresh");
       renderHistory();
       speak(a.say ? `${a.text}。可以说：${a.say}` : a.text);
     } else {
@@ -427,13 +439,48 @@ let asrChain = Promise.resolve();
 let asrFailed = false;
 let asrBusy = 0;
 
+let partialSeq = 0;
+let partialBusy = false;
+
 function transcribeLater(blob) {
   // one request at a time keeps sentences in order
   asrBusy++;
+  partialSeq++; // any preview still in flight is now out of date
   asrChain = asrChain
     .then(() => transcribe(blob))
     .catch(() => {})
-    .finally(() => asrBusy--);
+    .finally(() => {
+      asrBusy--;
+      if (!asrBusy) renderPartial("");
+    });
+}
+
+// Live caption preview: while someone is still talking, recognise what has been said so
+// far and show it greyed out; the final result for the sentence replaces it.
+function previewPartial(blob) {
+  if (partialBusy || asrBusy || asrFailed || !state.listening) return; // finals come first
+  partialBusy = true;
+  const seq = ++partialSeq;
+  recognizeQuietly(blob)
+    .then((text) => seq === partialSeq && state.listening && text && renderPartial(text + " …"))
+    .catch(() => {})
+    .finally(() => (partialBusy = false));
+}
+
+async function recognizeQuietly(blob) {
+  const id = activeAsr();
+  if (id === "doubao") return (await transcribeDoubao(blob)).trim();
+  const p = ASR[id];
+  if (!p) return "";
+  const fd = new FormData();
+  fd.append("model", p.model);
+  fd.append("file", blob, "speech.wav");
+  const res = await fetch(p.url, { method: "POST", headers: { Authorization: "Bearer " + p.key() }, body: fd });
+  if (!res.ok) return "";
+  const json = await res.json().catch(() => ({}));
+  return String(json.text || "")
+    .replace(/<\|[^|]*\|>/g, "")
+    .trim();
 }
 
 const blobToBase64 = (blob) =>
@@ -565,6 +612,7 @@ async function startCloudListening() {
   let lastLevel = 0;
   const rec = new SegmentRecorder({
     onSegment: transcribeLater,
+    onPartial: previewPartial,
     onLevel: (rms, speakingSec) => {
       const speaking = speakingSec > 0;
       if (!state.listening || recorder !== rec) return;
@@ -573,9 +621,8 @@ async function startCloudListening() {
       const bars = "▁▂▃▄▅▆▇█";
       const n = Math.max(0, Math.min(7, Math.round(Math.log10(Math.max(rms, 1e-4) / 1e-3) * 3.5)));
       const meter = bars.slice(0, n + 1);
-      const last = state.transcript.slice(-1)[0]?.text || "";
       const label = speaking ? `正在听 ${Math.floor(speakingSec)}秒` : asrBusy ? "识别中" : "在听";
-      renderLive(`${label} ${meter}${last ? "　" + last : ""}`);
+      renderLive(`${label} ${meter}`);
     },
   });
   recorder = rec;
@@ -610,8 +657,9 @@ function commit(text, manual = false) {
   if (!text) return;
   state.transcript.push({ at: Date.now(), text, manual });
   LS.set("transcript", state.transcript.slice(-400));
+  renderPartial("");
   renderTranscript();
-  scheduleAnalyze(manual ? 0 : 700);
+  scheduleAnalyze(manual ? 0 : 300);
 }
 
 function startRecognizer() {
@@ -637,7 +685,7 @@ function startRecognizer() {
       }
     }
     interim = partial;
-    renderLive(interim);
+    renderPartial(interim);
     // iOS Safari often never marks results final in continuous mode:
     // treat a pause (or a very long run) as the end of a sentence, then restart.
     clearTimeout(silenceTimer);
@@ -844,9 +892,15 @@ function renderTranscript() {
       return p;
     }),
   );
-  $("#tcount").textContent = state.transcript.length ? `（${state.transcript.length} 句）` : "";
-  const last = state.transcript[state.transcript.length - 1];
-  if (!interim) renderLive(last ? last.text : "");
+  $("#tcount").textContent = state.transcript.length ? `${state.transcript.length} 句` : "";
+  $("#captions").classList.toggle("empty", !state.transcript.length);
+  box.scrollTop = box.scrollHeight;
+}
+
+// the sentence still being spoken, shown greyed out under the captions
+function renderPartial(t) {
+  $("#partial").textContent = t || "";
+  if (t) $("#transcript").scrollTop = $("#transcript").scrollHeight;
 }
 
 function renderLive(t) {

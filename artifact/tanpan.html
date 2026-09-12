@@ -84,10 +84,22 @@
   .history li.plan b { color: var(--plan); } .history li.big b { color: var(--big); }
   .history time { color: var(--dim); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 
-  .transcript { margin: 14px 0 18px; color: var(--dim); font-size: 14px; }
-  .transcript summary { cursor: pointer; padding: 6px 2px; }
-  .transcript p { margin: 4px 0; }
-  .transcript p.manual { color: var(--ask); }
+  .card.fresh { animation: fresh 1.2s ease-out; }
+  @keyframes fresh { 0% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 70%, transparent); } 100% { box-shadow: 0 0 0 0 transparent; } }
+
+  .captions {
+    margin-top: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 8px 12px 10px; display: flex; flex-direction: column; gap: 4px;
+  }
+  .cap-head { display: flex; justify-content: space-between; color: var(--dim); font-size: 12px; letter-spacing: .08em; }
+  .cap-body { max-height: 34vh; overflow-y: auto; font-size: 20px; line-height: 1.5; color: var(--dim); }
+  .cap-body p { margin: 4px 0; }
+  .cap-body p:last-child { color: var(--paper); font-size: 23px; font-weight: 600; }
+  .cap-body p.manual { color: var(--ask); }
+  .partial { margin: 0; font-size: 23px; line-height: 1.5; color: var(--dim); }
+  .partial:empty, .cap-empty { display: none; }
+  .captions.empty .cap-empty { display: block; margin: 0; color: var(--dim); font-size: 14px; }
+  .captions.empty .partial:not(:empty) ~ .cap-empty { display: none; }
 
   .bar { padding: 10px 16px 12px; border-top: 1px solid var(--line); background: var(--ground); display: flex; flex-direction: column; gap: 10px; }
   .manual { display: flex; gap: 8px; }
@@ -152,8 +164,13 @@
     <div class="dict-row"><span>听写停了就再点一次 🎤</span><button id="dictDone" type="button" class="link">收起键盘</button></div>
   </section>
   <div id="live" class="live"></div>
+  <section id="captions" class="captions empty" aria-live="polite">
+    <div class="cap-head"><span>实时字幕</span><span id="tcount"></span></div>
+    <div id="transcript" class="cap-body"></div>
+    <p id="partial" class="partial"></p>
+    <p class="cap-empty">开始监听后，听到的话会实时显示在这里</p>
+  </section>
   <section class="history"><ol id="history"></ol></section>
-  <details class="transcript"><summary>转写记录 <span id="tcount"></span></summary><div id="transcript"></div></details>
 </main>
 
 <footer class="bar">

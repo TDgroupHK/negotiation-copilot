@@ -7,17 +7,21 @@ const FRAME = 320; // 20 ms at 16 kHz
 export class SegmentRecorder {
   constructor({
     onSegment,
+    onPartial, // (wavBlob, seconds) every partialMs while someone is talking, for live captions
     onState,
     onLevel,
-    silenceMs = 600,
-    softMs = 8000, // after this long, cut at the next dip in the voice
-    maxMs = 15000, // never let one piece run longer than this
+    silenceMs = 500,
+    softMs = 6000, // after this long, cut at the next dip in the voice
+    maxMs = 12000, // never let one piece run longer than this
+    partialMs = 2000,
     minSpeechMs = 400,
     prerollMs = 300,
   }) {
     this.onSegment = onSegment;
+    this.onPartial = onPartial;
     this.onState = onState || (() => {});
     this.onLevel = onLevel || (() => {});
+    this.partialFrames = partialMs / 20;
     this.frames = 0;
     this.silenceFrames = silenceMs / 20;
     this.softFrames = softMs / 20;
@@ -121,6 +125,9 @@ export class SegmentRecorder {
     }
 
     s.frames.push(f);
+    if (this.onPartial && s.frames.length % this.partialFrames === 0) {
+      this.onPartial(encodeWav(joinFrames(s.frames)), s.frames.length / 50);
+    }
     // a pause = clearly quieter than this speaker's own voice, not just below a fixed level
     const quietBelow = Math.max(base, s.voice * 0.3);
     if (rms > quietBelow) {
@@ -147,10 +154,15 @@ export class SegmentRecorder {
     if (!s) return;
     this.onState(final ? "stopped" : "idle");
     if (s.loud < this.minSpeechFrames) return; // a cough, a door, a click
-    const pcm = new Float32Array(s.frames.length * FRAME);
-    s.frames.forEach((fr, i) => pcm.set(fr, i * FRAME));
+    const pcm = joinFrames(s.frames);
     this.onSegment(encodeWav(pcm), pcm.length / RATE);
   }
+}
+
+function joinFrames(frames) {
+  const pcm = new Float32Array(frames.length * FRAME);
+  frames.forEach((fr, i) => pcm.set(fr, i * FRAME));
+  return pcm;
 }
 
 function encodeWav(samples) {
