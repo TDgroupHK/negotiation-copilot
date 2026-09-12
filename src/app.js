@@ -24,7 +24,18 @@ const MODELS = {
 };
 
 const settings = Object.assign(
-  { apiKey: "", baseURL: "", model: "claude-opus-5", effort: "low", lang: "zh-CN", minChars: 12, speak: false },
+  {
+    provider: "zhipu", // "zhipu" (free GLM) | "anthropic" (Claude API)
+    zhipuKey: "",
+    zhipuModel: "glm-4.7-flash",
+    apiKey: "",
+    baseURL: "",
+    model: "claude-opus-5",
+    effort: "low",
+    lang: "zh-CN",
+    minChars: 12,
+    speak: false,
+  },
   LS.get("settings", {}),
 );
 const prep = Object.assign({ me: "", goal: "", them: "", notes: "" }, LS.get("prep", {}));
@@ -37,13 +48,36 @@ const state = {
   analyzedCount: 0, // transcript entries already analyzed
   inFlight: null,
   pending: false,
+  dictation: false, // using the iOS keyboard's dictation instead of the page's own speech recognition
+  lastAutoAt: 0,
+  autoPausedUntil: 0,
   usage: LS.get("usage", { calls: 0, cost: 0 }),
 };
 state.analyzedCount = state.transcript.length;
 
 const $ = (s) => document.querySelector(s);
 
-// ---------- Claude ----------
+// ---------- backend ----------
+// Opened inside Claude (as an Artifact): use the viewer's own Claude account via `sample`.
+// Opened anywhere else: use the API key from settings.
+let sample = null;
+let sampleBlocked = false;
+const sampleReady = window.claude?.use
+  ? window.claude.use("sample").then(
+      (s) => (sample = s),
+      () => null,
+    )
+  : Promise.resolve(null);
+
+const usingAccount = () => !!sample && !sampleBlocked;
+const hasKey = () =>
+  settings.provider === "zhipu" ? !!settings.zhipuKey : !!(settings.apiKey || settings.baseURL.trim());
+
+const ZHIPU_MODELS = {
+  "glm-4.7-flash": "GLM-4.7-Flash（免费，推荐）",
+  "glm-4-flash-250414": "GLM-4-Flash（免费，更快）",
+};
+
 function client() {
   return new Anthropic({
     apiKey: settings.apiKey || "none",
@@ -140,25 +174,81 @@ function parseAdvice(text, manual) {
   return { kind, text: [head, ...rest].join("\n"), say };
 }
 
-async function analyze(manual = false) {
-  if (!settings.apiKey && !settings.baseURL.trim()) {
-    showNotice("请先在「设置」里填写 Claude API Key");
-    openSheet("setSheet");
-    return;
+// Zhipu GLM (OpenAI-style chat completions, SSE stream). Its API allows browser (CORS) calls.
+async function runZhipu(manual, signal, onText) {
+  const res = await fetch("https://open.bigmodel.cn/api/paas/v4/chat/completions", {
+    method: "POST",
+    signal,
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + settings.zhipuKey },
+    body: JSON.stringify({
+      model: settings.zhipuModel in ZHIPU_MODELS ? settings.zhipuModel : "glm-4.7-flash",
+      stream: true,
+      thinking: { type: manual ? "enabled" : "disabled" },
+      max_tokens: manual ? 4000 : 400,
+      temperature: 0.3,
+      messages: [
+        { role: "system", content: systemPrompt(manual) },
+        { role: "user", content: userContent(manual) },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    let body = {};
+    try {
+      body = await res.json();
+    } catch {}
+    const zcode = String(body?.error?.code ?? "");
+    if (zcode === "1301") return { text: "", refused: true }; // content filter
+    throw { zhipu: true, status: res.status, zcode, message: body?.error?.message || "" };
   }
-  if (!manual && state.transcript.length === state.analyzedCount) return;
 
-  if (state.inFlight) {
-    if (!manual) {
-      state.pending = true;
-      return;
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let text = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (data === "[DONE]") continue;
+      try {
+        const delta = JSON.parse(data).choices?.[0]?.delta?.content;
+        if (delta) {
+          text += delta;
+          onText(text);
+        }
+      } catch {}
     }
-    state.inFlight.abort();
+  }
+  state.usage.calls += 1;
+  return { text, refused: false };
+}
+
+// One model call. Resolves {text, refused}; rejects with the backend's own error.
+async function runModel(manual, signal, onText) {
+  if (!usingAccount() && settings.provider === "zhipu") return runZhipu(manual, signal, onText);
+  if (usingAccount()) {
+    try {
+      const { text } = await sample(systemPrompt(manual) + "\n\n" + userContent(manual), {
+        modelTier: manual ? "default" : "quick",
+        cache: false,
+        signal,
+        onText: ({ text }) => onText(text),
+      });
+      state.usage.calls += 1;
+      return { text, refused: false };
+    } catch (e) {
+      if (e?.code === "refused") return { text: "", refused: true };
+      throw e;
+    }
   }
 
-  const ctl = new AbortController();
-  state.inFlight = ctl;
-  const upTo = state.transcript.length;
   const m = MODELS[settings.model] || MODELS["claude-opus-5"];
   const params = {
     model: settings.model in MODELS ? settings.model : "claude-opus-5",
@@ -171,46 +261,72 @@ async function analyze(manual = false) {
     params.betas = ["server-side-fallback-2026-07-01"];
     params.fallbacks = "default";
   }
+  let text = "";
+  const stream = client().beta.messages.stream(params, { signal });
+  stream.on("text", (delta) => {
+    text += delta;
+    onText(text);
+  });
+  const msg = await stream.finalMessage();
+  const u = msg.usage || {};
+  state.usage.calls += 1;
+  state.usage.cost += ((u.input_tokens || 0) * m.inPrice + (u.output_tokens || 0) * m.outPrice) / 1e6;
+  return { text, refused: msg.stop_reason === "refusal" };
+}
+
+async function analyze(manual = false) {
+  if (!usingAccount() && !hasKey()) {
+    showNotice(sampleBlocked ? "没有获得使用你 Claude 账号的授权。刷新页面，在弹窗里选择允许" : "请先在「设置」里填写 API Key");
+    if (!sampleBlocked) openSheet("setSheet");
+    return;
+  }
+  if (!manual) {
+    if (state.transcript.length === state.analyzedCount) return;
+    if (Date.now() < state.autoPausedUntil) return;
+    const wait = state.lastAutoAt + (usingAccount() ? 6000 : 2500) - Date.now();
+    if (wait > 0) return scheduleAnalyze(wait);
+  }
+
+  if (state.inFlight) {
+    if (!manual) {
+      state.pending = true;
+      return;
+    }
+    state.inFlight.abort();
+  }
+
+  const ctl = new AbortController();
+  state.inFlight = ctl;
+  if (!manual) state.lastAutoAt = Date.now();
+  const upTo = state.transcript.length;
 
   setThinking(true, manual);
-  let text = "";
   try {
-    const stream = client().beta.messages.stream(params, { signal: ctl.signal });
-    stream.on("text", (delta) => {
-      text += delta;
+    const { text, refused } = await runModel(manual, ctl.signal, (soFar) => {
+      if (ctl.signal.aborted) return;
       // don't flash anything while the reply might still turn out to be "PASS"
-      if (!manual && "PASS".startsWith(text.trim().slice(0, 4).toUpperCase())) return;
-      const a = parseAdvice(text, manual);
+      if (!manual && "PASS".startsWith(soFar.trim().slice(0, 4).toUpperCase())) return;
+      const a = parseAdvice(soFar, manual);
       if (a) renderCard({ ...a, at: Date.now(), manual, streaming: true });
     });
-    const msg = await stream.finalMessage();
     state.analyzedCount = Math.max(state.analyzedCount, upTo);
-
-    const u = msg.usage || {};
-    state.usage.calls += 1;
-    state.usage.cost +=
-      ((u.input_tokens || 0) * m.inPrice + (u.output_tokens || 0) * m.outPrice) / 1e6;
     LS.set("usage", state.usage);
 
-    if (msg.stop_reason === "refusal") {
-      if (manual) showNotice("Claude 这次拒绝了回答，换个说法再试");
-      renderCard(state.advice[0] || null);
+    const a = refused ? null : parseAdvice(text, manual);
+    if (refused && manual) showNotice("Claude 这次没有回答，换个说法再试");
+    if (a) {
+      const item = { ...a, at: Date.now(), manual };
+      state.advice.unshift(item);
+      state.advice = state.advice.slice(0, 50);
+      LS.set("advice", state.advice);
+      renderCard(item);
+      renderHistory();
+      speak(a.say ? `${a.text}。可以说：${a.say}` : a.text);
     } else {
-      const a = parseAdvice(text, manual);
-      if (a) {
-        const item = { ...a, at: Date.now(), manual };
-        state.advice.unshift(item);
-        state.advice = state.advice.slice(0, 50);
-        LS.set("advice", state.advice);
-        renderCard(item);
-        renderHistory();
-        speak(a.say ? `${a.text}。可以说：${a.say}` : a.text);
-      } else {
-        renderCard(state.advice[0] || null);
-      }
+      renderCard(state.advice[0] || null);
     }
   } catch (err) {
-    if (ctl.signal.aborted) return;
+    if (ctl.signal.aborted || err?.code === "cancelled") return;
     showNotice(errorText(err));
     renderCard(state.advice[0] || null);
   } finally {
@@ -227,6 +343,36 @@ async function analyze(manual = false) {
 }
 
 function errorText(err) {
+  if (err?.zhipu) {
+    if (err.status === 401) return "智谱 API Key 无效，请到「设置」检查";
+    if (err.status === 429) {
+      state.autoPausedUntil = Date.now() + 20000;
+      return "智谱免费版正在限流（下午到晚上高峰期常见），自动提醒暂停 20 秒后继续";
+    }
+    return `智谱出错（${err.status}${err.zcode ? " / " + err.zcode : ""}）：${(err.message || "").slice(0, 60)}`;
+  }
+  if (err instanceof TypeError) return "连不上 AI 服务器，请检查网络";
+
+  // Claude-account errors are plain {code, message} objects
+  switch (err?.code) {
+    case "not_granted":
+    case "sampling_disabled":
+    case "not_declared":
+    case "capability_disabled":
+    case "capability_removed":
+      sampleBlocked = true;
+      applyBackendUI();
+      return "没有获得使用你 Claude 账号的授权，自动提醒已停止。刷新页面，在弹窗里选择允许";
+    case "rate_limited":
+      state.autoPausedUntil = Date.now() + 60000;
+      return "Claude 用量暂时到上限了，自动提醒暂停 1 分钟；「现在怎么办？」稍后可以再点";
+    case "session_expired":
+      return "Claude 登录已过期，请重新登录后刷新页面";
+    case "prompt_too_large":
+      return "这场对话太长了，请在「设置」里点「清空本场」后继续";
+  }
+  if (err?.code) return "Claude 暂时出错，稍后再试";
+
   if (err instanceof Anthropic.AuthenticationError) return "API Key 无效，请到「设置」检查";
   if (err instanceof Anthropic.PermissionDeniedError) return "这个 API Key 没有权限使用所选模型";
   if (err instanceof Anthropic.NotFoundError) return "模型不存在或 API 地址不对，请检查设置";
@@ -305,7 +451,8 @@ function startRecognizer() {
     if (rec !== r) return;
     if (e.error === "not-allowed" || e.error === "service-not-allowed") {
       stopListening();
-      showNotice("没有麦克风权限：请在 iPhone 设置 → Safari → 麦克风 中允许，然后刷新页面");
+      enterDictation();
+      showNotice("这里不能直接收音，已换成键盘听写：点上方输入框，再点键盘上的 🎤 麦克风");
     } else if (e.error === "network") {
       showNotice("语音识别需要联网，网络不通");
     } else if (e.error === "language-not-supported") {
@@ -348,8 +495,11 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function startListening() {
-  if (!SR) {
-    showNotice("这个浏览器不支持语音识别。iPhone 请直接用 Safari 打开（不要从主屏幕图标或微信里打开），也可以先用下方手动补充");
+  // ask for the Claude-account permission on this tap, not in the middle of the conversation
+  if (usingAccount()) window.claude.use("permissions").then((p) => p?.request(["sample"]), () => null);
+  if (state.dictation || !SR) {
+    enterDictation();
+    $("#dictArea").focus(); // inside the tap, so iOS opens the keyboard
     return;
   }
   state.listening = true;
@@ -378,6 +528,27 @@ function stopListening() {
   renderStatus();
 }
 
+// ---------- keyboard dictation ----------
+// Where the page can't reach the microphone (e.g. inside Claude on iPhone), the iOS keyboard's
+// own dictation types into #dictArea; every pause hands the newly typed text to Claude.
+let dictCommitted = 0;
+let dictTimer = 0;
+
+function enterDictation() {
+  state.dictation = true;
+  $("#dictBox").hidden = false;
+  renderStatus();
+}
+
+function flushDictation() {
+  clearTimeout(dictTimer);
+  const v = $("#dictArea").value;
+  if (v.length < dictCommitted) dictCommitted = v.length; // text was edited or deleted
+  const fresh = v.slice(dictCommitted).trim();
+  dictCommitted = v.length;
+  if (fresh) commit(fresh);
+}
+
 // ---------- earphone speech ----------
 function primeSpeech() {
   // iOS only lets speechSynthesis talk after a user gesture; warm it up on the Start tap
@@ -404,7 +575,11 @@ function renderCard(a) {
   if (!a) {
     card.className = "card empty";
     $("#kind").textContent = "";
-    $("#advice").textContent = state.listening ? "正在听……有值得提醒的会显示在这里" : "先在「背景」里写下目标和底线，然后点「开始监听」。";
+    $("#advice").textContent = state.dictation
+      ? "点下面的输入框，再点键盘上的 🎤 麦克风开始听写。有值得提醒的会显示在这里"
+      : state.listening
+        ? "正在听……有值得提醒的会显示在这里"
+        : "先在「背景」里写下目标和底线，然后点「开始监听」。";
     $("#say").hidden = true;
     $("#ago").textContent = "";
     return;
@@ -465,6 +640,15 @@ function renderLive(t) {
 }
 
 function renderStatus() {
+  if (state.dictation) {
+    const active = document.activeElement === $("#dictArea");
+    $("#dot").className = "dot" + (active ? " on" : "");
+    $("#statusText").textContent = active ? "键盘听写中" : "键盘听写";
+    $("#micBtn").textContent = "键盘听写";
+    $("#micBtn").classList.remove("on");
+    if (!state.advice.length) renderCard(null);
+    return;
+  }
   $("#dot").className = "dot" + (state.listening ? " on" : "");
   $("#statusText").textContent = state.listening ? "监听中" : state.transcript.length ? "已暂停" : "未开始";
   $("#micBtn").textContent = state.listening ? "暂停" : state.transcript.length ? "继续监听" : "开始监听";
@@ -478,8 +662,30 @@ function setThinking(on, manual) {
 }
 
 function renderMeta() {
+  if (usingAccount()) {
+    $("#meta").textContent = `用你的 Claude 账号额度 · 已分析 ${state.usage.calls} 次`;
+    return;
+  }
+  if (settings.provider === "zhipu") {
+    const name = (ZHIPU_MODELS[settings.zhipuModel] || settings.zhipuModel).replace(/（.*）/, "");
+    $("#meta").textContent = `智谱 ${name}（免费）· 已分析 ${state.usage.calls} 次`;
+    return;
+  }
   const m = MODELS[settings.model];
   $("#meta").textContent = `${m ? m.label.replace(/（.*）/, "") : settings.model} · 已分析 ${state.usage.calls} 次 · 约 $${state.usage.cost.toFixed(2)}`;
+}
+
+function applyBackendUI() {
+  const account = usingAccount();
+  const prov = $("#fProvider").value || settings.provider;
+  document.querySelectorAll(".api-only").forEach((el) => {
+    el.hidden =
+      account ||
+      (el.classList.contains("p-zhipu") && prov !== "zhipu") ||
+      (el.classList.contains("p-anthropic") && prov !== "anthropic");
+  });
+  $("#accountNote").hidden = !account;
+  renderMeta();
 }
 
 let noticeTimer = 0;
@@ -488,7 +694,7 @@ function showNotice(t) {
   n.textContent = t;
   n.hidden = false;
   clearTimeout(noticeTimer);
-  noticeTimer = setTimeout(() => (n.hidden = true), 6000);
+  noticeTimer = setTimeout(() => (n.hidden = true), 7000);
 }
 
 setInterval(() => {
@@ -500,6 +706,10 @@ setInterval(() => {
 function openSheet(id) {
   document.querySelectorAll(".sheet").forEach((s) => (s.hidden = s.id !== id));
   if (id === "setSheet") {
+    $("#fProvider").value = settings.provider;
+    $("#fZKey").value = settings.zhipuKey;
+    $("#fZModel").value = settings.zhipuModel;
+    applyBackendUI();
     $("#fKey").value = settings.apiKey;
     $("#fBase").value = settings.baseURL;
     $("#fModel").value = settings.model;
@@ -521,12 +731,27 @@ function closeSheets() {
 function init() {
   const sel = $("#fModel");
   for (const [id, m] of Object.entries(MODELS)) sel.add(new Option(m.label, id));
+  const zsel = $("#fZModel");
+  for (const [id, label] of Object.entries(ZHIPU_MODELS)) zsel.add(new Option(label, id));
+  $("#fProvider").onchange = applyBackendUI;
 
   $("#micBtn").onclick = () => (state.listening ? stopListening() : startListening());
   $("#askBtn").onclick = () => analyze(true);
   $("#prepBtn").onclick = () => openSheet("prepSheet");
   $("#setBtn").onclick = () => openSheet("setSheet");
   document.querySelectorAll("[data-close]").forEach((b) => (b.onclick = closeSheets));
+
+  const dict = $("#dictArea");
+  dict.addEventListener("input", () => {
+    clearTimeout(dictTimer);
+    dictTimer = setTimeout(flushDictation, 1500);
+  });
+  dict.addEventListener("focus", renderStatus);
+  dict.addEventListener("blur", () => {
+    flushDictation();
+    renderStatus();
+  });
+  $("#dictDone").onclick = () => dict.blur();
 
   $("#manualForm").onsubmit = (e) => {
     e.preventDefault();
@@ -537,6 +762,9 @@ function init() {
 
   $("#setForm").onsubmit = (e) => {
     e.preventDefault();
+    settings.provider = $("#fProvider").value;
+    settings.zhipuKey = $("#fZKey").value.trim();
+    settings.zhipuModel = $("#fZModel").value;
     settings.apiKey = $("#fKey").value.trim();
     settings.baseURL = $("#fBase").value.trim();
     settings.model = $("#fModel").value;
@@ -604,7 +832,10 @@ function init() {
   renderCard(state.advice[0] || null);
   renderStatus();
   renderMeta();
-  if (!settings.apiKey && !settings.baseURL) openSheet("setSheet");
+  sampleReady.then(() => {
+    applyBackendUI();
+    if (!usingAccount() && !hasKey()) openSheet("setSheet");
+  });
 }
 
 init();
