@@ -206,7 +206,16 @@
         <option value="medium">中</option>
         <option value="high">高（慢）</option>
       </select></label>
-    <label class="field"><span>识别语言</span>
+    <label class="field api-only"><span>语音识别</span>
+      <select id="fAsr">
+        <option value="siliconflow">硅基流动 SenseVoice（免费，准确，推荐）</option>
+        <option value="zhipu">智谱 GLM-ASR（最准，约 0.06 元/分钟，需充值）</option>
+        <option value="browser">手机自带（免费，准确率低）</option>
+      </select></label>
+    <label class="field api-only asr-sf"><span>硅基流动 API Key（在 cloud.siliconflow.cn 的「API 密钥」页面复制）</span>
+      <input id="fSfKey" type="password" placeholder="sk-..." autocapitalize="off" spellcheck="false"></label>
+    <p class="hint api-only asr-zhipu">使用上面填写的智谱 API Key，按录音时长计费。</p>
+    <label class="field asr-browser"><span>识别语言</span>
       <select id="fLang">
         <option value="zh-CN">普通话</option>
         <option value="zh-HK">粤语</option>

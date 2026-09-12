@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { SegmentRecorder } from "./recorder.js";
 
 // ---------- storage ----------
 const LS = {
@@ -28,6 +29,8 @@ const settings = Object.assign(
     provider: "zhipu", // "zhipu" (free GLM) | "anthropic" (Claude API)
     zhipuKey: "",
     zhipuModel: "glm-4.7-flash",
+    asr: "siliconflow", // speech-to-text: "siliconflow" (free) | "zhipu" (paid) | "browser" (phone built-in)
+    sfKey: "",
     apiKey: "",
     baseURL: "",
     model: "claude-opus-5",
@@ -393,7 +396,110 @@ function scheduleAnalyze(delay = 700) {
   }, delay);
 }
 
-// ---------- speech recognition ----------
+// ---------- cloud speech-to-text ----------
+// The page records each utterance itself (recorder.js) and sends it as a WAV to a
+// transcription API — far more accurate than the phone's built-in web recognition.
+const ASR = {
+  siliconflow: {
+    name: "硅基流动 SenseVoice",
+    url: "https://api.siliconflow.cn/v1/audio/transcriptions",
+    model: "FunAudioLLM/SenseVoiceSmall",
+    key: () => settings.sfKey,
+  },
+  zhipu: {
+    name: "智谱 GLM-ASR",
+    url: "https://open.bigmodel.cn/api/paas/v4/audio/transcriptions",
+    model: "glm-asr-2512",
+    key: () => settings.zhipuKey,
+  },
+};
+const activeAsr = () => (ASR[settings.asr]?.key() ? settings.asr : "browser");
+
+let recorder = null;
+let asrChain = Promise.resolve();
+let asrFailed = false;
+
+function transcribeLater(blob) {
+  // one request at a time keeps sentences in order
+  asrChain = asrChain.then(() => transcribe(blob)).catch(() => {});
+}
+
+async function transcribe(blob) {
+  const id = activeAsr();
+  const p = ASR[id];
+  if (!p || asrFailed) return;
+  const fd = new FormData();
+  fd.append("model", p.model);
+  fd.append("file", blob, "speech.wav");
+  if (id === "zhipu") {
+    // the previous sentences help GLM-ASR with names and context
+    const ctx = state.transcript.slice(-8).map((e) => e.text).join(" ");
+    if (ctx) fd.append("prompt", ctx.slice(-500));
+  }
+  if (state.listening) renderLive("识别中…");
+  let res;
+  try {
+    res = await fetch(p.url, { method: "POST", headers: { Authorization: "Bearer " + p.key() }, body: fd });
+  } catch {
+    showNotice("语音识别连不上服务器，请检查网络");
+    return;
+  }
+  if (!res.ok) {
+    let body = {};
+    try {
+      body = await res.json();
+    } catch {}
+    const code = String(body?.error?.code ?? body?.code ?? "");
+    if (res.status === 401) {
+      asrFailed = true;
+      stopListening();
+      showNotice(`${p.name} 的 API Key 无效，请到「设置」检查`);
+    } else if (code === "1113" || res.status === 402) {
+      asrFailed = true;
+      stopListening();
+      showNotice(`${p.name} 账户余额不足。可以在「设置」里把「语音识别」换成免费的硅基流动`);
+    } else if (res.status === 429) {
+      showNotice("语音识别请求太频繁，这一句可能漏掉了");
+    } else {
+      showNotice(`语音识别出错（${res.status}${code ? " / " + code : ""}）`);
+    }
+    return;
+  }
+  const json = await res.json().catch(() => ({}));
+  // SenseVoice can prefix tags like <|zh|><|NEUTRAL|>; drop them
+  const text = String(json.text || "")
+    .replace(/<\|[^|]*\|>/g, "")
+    .trim();
+  if (text) commit(text);
+  else if (state.listening) renderLive("");
+}
+
+async function startCloudListening() {
+  asrFailed = false;
+  state.listening = true;
+  if (!state.startedAt) state.startedAt = Date.now();
+  primeSpeech();
+  keepAwake();
+  renderStatus();
+  recorder = new SegmentRecorder({
+    onSegment: transcribeLater,
+    onState: (s) => state.listening && s === "speaking" && renderLive("正在听…"),
+  });
+  try {
+    await recorder.start();
+  } catch (err) {
+    recorder = null;
+    stopListening();
+    if (err?.name === "NotAllowedError") {
+      showNotice("没有麦克风权限：请在 iPhone 设置 → Safari → 麦克风 中允许，然后刷新页面");
+    } else {
+      enterDictation();
+      showNotice("这里不能直接收音，已换成键盘听写：点上方输入框，再点键盘上的 🎤 麦克风");
+    }
+  }
+}
+
+// ---------- phone built-in speech recognition ----------
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let rec = null;
 let silenceTimer = 0;
@@ -490,13 +596,18 @@ async function keepAwake() {
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && state.listening) {
     keepAwake();
-    restartRecognizer();
+    if (recorder) recorder.ctx?.resume().catch(() => {});
+    else restartRecognizer();
   }
 });
 
 function startListening() {
   // ask for the Claude-account permission on this tap, not in the middle of the conversation
   if (usingAccount()) window.claude.use("permissions").then((p) => p?.request(["sample"]), () => null);
+  if (!state.dictation && activeAsr() !== "browser" && navigator.mediaDevices?.getUserMedia) {
+    startCloudListening();
+    return;
+  }
   if (state.dictation || !SR) {
     enterDictation();
     $("#dictArea").focus(); // inside the tap, so iOS opens the keyboard
@@ -522,6 +633,9 @@ function stopListening() {
   try {
     old?.stop();
   } catch {}
+  const r = recorder;
+  recorder = null;
+  r?.stop(); // hands over the sentence in progress
   wakeLock?.release?.().catch(() => {});
   wakeLock = null;
   renderLive("");
@@ -668,7 +782,8 @@ function renderMeta() {
   }
   if (settings.provider === "zhipu") {
     const name = (ZHIPU_MODELS[settings.zhipuModel] || settings.zhipuModel).replace(/（.*）/, "");
-    $("#meta").textContent = `智谱 ${name}（免费）· 已分析 ${state.usage.calls} 次`;
+    const asr = ASR[activeAsr()]?.name || "手机自带";
+    $("#meta").textContent = `识别：${asr} · 分析：智谱 ${name} · ${state.usage.calls} 次`;
     return;
   }
   const m = MODELS[settings.model];
@@ -684,6 +799,10 @@ function applyBackendUI() {
       (el.classList.contains("p-zhipu") && prov !== "zhipu") ||
       (el.classList.contains("p-anthropic") && prov !== "anthropic");
   });
+  const asr = $("#fAsr").value || settings.asr;
+  document.querySelectorAll(".asr-sf").forEach((el) => (el.hidden = asr !== "siliconflow"));
+  document.querySelectorAll(".asr-zhipu").forEach((el) => (el.hidden = asr !== "zhipu"));
+  document.querySelectorAll(".asr-browser").forEach((el) => (el.hidden = asr !== "browser"));
   $("#accountNote").hidden = !account;
   renderMeta();
 }
@@ -709,6 +828,8 @@ function openSheet(id) {
     $("#fProvider").value = settings.provider;
     $("#fZKey").value = settings.zhipuKey;
     $("#fZModel").value = settings.zhipuModel;
+    $("#fAsr").value = settings.asr;
+    $("#fSfKey").value = settings.sfKey;
     applyBackendUI();
     $("#fKey").value = settings.apiKey;
     $("#fBase").value = settings.baseURL;
@@ -734,6 +855,7 @@ function init() {
   const zsel = $("#fZModel");
   for (const [id, label] of Object.entries(ZHIPU_MODELS)) zsel.add(new Option(label, id));
   $("#fProvider").onchange = applyBackendUI;
+  $("#fAsr").onchange = applyBackendUI;
 
   $("#micBtn").onclick = () => (state.listening ? stopListening() : startListening());
   $("#askBtn").onclick = () => analyze(true);
@@ -765,6 +887,9 @@ function init() {
     settings.provider = $("#fProvider").value;
     settings.zhipuKey = $("#fZKey").value.trim();
     settings.zhipuModel = $("#fZModel").value;
+    settings.asr = $("#fAsr").value;
+    settings.sfKey = $("#fSfKey").value.trim();
+    asrFailed = false;
     settings.apiKey = $("#fKey").value.trim();
     settings.baseURL = $("#fBase").value.trim();
     settings.model = $("#fModel").value;
