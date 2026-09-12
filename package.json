@@ -1,0 +1,15 @@
+{
+  "name": "negotiation-copilot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "谈判参谋：iPhone Safari 收音，Claude 实时给出谈判提醒",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/app.js --bundle --format=esm --target=safari15 --minify --outfile=docs/app.js",
+    "mock": "node test/mock-server.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.125.0",
+    "esbuild": "^0.28.2"
+  }
+}
