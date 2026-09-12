@@ -1010,6 +1010,10 @@ function agoText(at) {
 }
 
 function renderHistory() {
+  // older advice stays folded away; only the newest one is on the card
+  const older = Math.max(0, state.advice.length - 1);
+  $("#historyBox").hidden = !older;
+  $("#hcount").textContent = older ? `（${older} 条）` : "";
   const ol = $("#history");
   ol.replaceChildren(
     ...state.advice.slice(1, 12).map((a) => {
