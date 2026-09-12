@@ -29,7 +29,7 @@ const settings = Object.assign(
   {
     provider: "zhipu", // "zhipu" (free GLM) | "ark" (Volcengine Doubao) | "anthropic" (Claude API)
     arkKey: "",
-    arkModel: "",
+    arkModel: "doubao-seed-2-0-mini-260428",
     zhipuKey: "",
     zhipuModel: "glm-4-flash-250414",
     asr: "doubao", // speech-to-text: "doubao" | "siliconflow" (free) | "zhipu" (paid) | "browser" (phone built-in)
