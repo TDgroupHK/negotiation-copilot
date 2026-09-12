@@ -616,6 +616,9 @@ async function transcribe(blob) {
 // ---------- Doubao streaming ----------
 let stream = null;
 let streamErrors = [];
+// which streaming product the app's trial is on isn't visible from here: try 1.0, then 2.0
+const STREAM_RESOURCES = ["volc.bigasr.sauc.duration", "volc.seedasr.sauc.duration"];
+let streamRes = LS.get("streamRes", STREAM_RESOURCES[0]);
 
 function joinFloat(chunks) {
   const out = new Float32Array(chunks.reduce((n, c) => n + c.length, 0));
@@ -631,11 +634,21 @@ function openStream() {
   const s = new DoubaoStream({
     appId: settings.dbAppId,
     token: settings.dbToken,
-    resourceId: "volc.bigasr.sauc.duration",
+    resourceId: streamRes,
     onPartial: (t) => stream === s && renderPartial(t ? t + " …" : ""),
     onFinal: (t) => stream === s && commit(t),
     onError: (code, msg) => {
       if (stream !== s) return;
+      // not entitled to this resource → try the other streaming product once
+      if (/resource|not granted|permission/i.test(String(msg)) && !s.triedOther) {
+        streamRes = STREAM_RESOURCES.find((r) => r !== streamRes);
+        LS.set("streamRes", streamRes);
+        stream = null;
+        s.stop();
+        openStream();
+        stream.triedOther = true;
+        return;
+      }
       const now = Date.now();
       streamErrors = streamErrors.filter((t) => now - t < 20000).concat(now);
       if (/grant not found|45000010|access key|app key/i.test(`${code} ${msg}`) || streamErrors.length >= 3) {
