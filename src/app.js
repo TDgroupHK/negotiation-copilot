@@ -27,7 +27,9 @@ const MODELS = {
 
 const settings = Object.assign(
   {
-    provider: "zhipu", // "zhipu" (free GLM) | "anthropic" (Claude API)
+    provider: "zhipu", // "zhipu" (free GLM) | "ark" (Volcengine Doubao) | "anthropic" (Claude API)
+    arkKey: "",
+    arkModel: "",
     zhipuKey: "",
     zhipuModel: "glm-4-flash-250414",
     asr: "doubao", // speech-to-text: "doubao" | "siliconflow" (free) | "zhipu" (paid) | "browser" (phone built-in)
@@ -59,6 +61,12 @@ if (LS.get("settingsVersion", 1) < 3) {
   LS.set("settings", settings);
   LS.set("settingsVersion", 3);
 }
+// v4: with Doubao credentials, streaming recognition is the fast default
+if (LS.get("settingsVersion", 1) < 4) {
+  if (settings.asr === "doubao" && settings.dbAppId && settings.dbToken) settings.asr = "doubao-stream";
+  LS.set("settings", settings);
+  LS.set("settingsVersion", 4);
+}
 
 const state = {
   listening: false,
@@ -69,6 +77,8 @@ const state = {
   inFlight: null,
   pending: false,
   dictation: false, // using the iOS keyboard's dictation instead of the page's own speech recognition
+  livePartial: "", // the sentence still being spoken (streaming recognition)
+  partialAnalyzed: "", // how much of it the AI has already seen
   lastAutoAt: 0,
   autoPausedUntil: 0,
   usage: LS.get("usage", { calls: 0, cost: 0 }),
@@ -91,7 +101,11 @@ const sampleReady = window.claude?.use
 
 const usingAccount = () => !!sample && !sampleBlocked;
 const hasKey = () =>
-  settings.provider === "zhipu" ? !!settings.zhipuKey : !!(settings.apiKey || settings.baseURL.trim());
+  settings.provider === "zhipu"
+    ? !!settings.zhipuKey
+    : settings.provider === "ark"
+      ? !!(settings.arkKey && settings.arkModel.trim())
+      : !!(settings.apiKey || settings.baseURL.trim());
 
 const ZHIPU_MODELS = {
   "glm-4-flash-250414": "GLM-4-Flash（免费，最快，推荐）",
@@ -173,7 +187,8 @@ function userContent(manual) {
   return [
     prev && `【你之前给过的提醒（不要重复）】\n${prev}`,
     `【之前的对话】\n${olderText || "（无）"}`,
-    manual ? `【最新内容】\n${fresh.map(line).join("\n") || "（无新内容）"}` : `【最新新增内容——重点看这里】\n${fresh.map(line).join("\n")}`,
+    manual ? `【最新内容】\n${fresh.map(line).join("\n") || "（无新内容）"}` : `【最新新增内容——重点看这里】\n${fresh.map(line).join("\n") || "（见下方正在说的话）"}`,
+    state.livePartial && `【正在说、还没说完的话（识别中，可能不完整）】\n${state.livePartial}`,
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -196,17 +211,31 @@ function parseAdvice(text, manual) {
 }
 
 // Zhipu GLM (OpenAI-style chat completions, SSE stream). Its API allows browser (CORS) calls.
-async function runZhipu(manual, signal, onText) {
+function runZhipu(manual, signal, onText) {
   const zmodel = settings.zhipuModel in ZHIPU_MODELS ? settings.zhipuModel : "glm-4-flash-250414";
-  const res = await fetch("https://open.bigmodel.cn/api/paas/v4/chat/completions", {
+  return runChat("https://open.bigmodel.cn/api/paas/v4/chat/completions", settings.zhipuKey, {
+    model: zmodel,
+    // only GLM-4.7-Flash has a thinking switch; GLM-4-Flash never thinks
+    ...(zmodel === "glm-4.7-flash" ? { thinking: { type: manual ? "enabled" : "disabled" } } : {}),
+  }, manual, signal, onText);
+}
+
+// Volcengine Ark (火山方舟) — Doubao models, same OpenAI-style API, also browser-callable.
+function runArk(manual, signal, onText) {
+  return runChat("https://ark.cn-beijing.volces.com/api/v3/chat/completions", settings.arkKey, {
+    model: settings.arkModel.trim(),
+    thinking: { type: manual ? "enabled" : "disabled" },
+  }, manual, signal, onText);
+}
+
+async function runChat(url, key, extra, manual, signal, onText) {
+  const res = await fetch(url, {
     method: "POST",
     signal,
-    headers: { "Content-Type": "application/json", Authorization: "Bearer " + settings.zhipuKey },
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
     body: JSON.stringify({
-      model: zmodel,
+      ...extra,
       stream: true,
-      // only GLM-4.7-Flash has a thinking switch; GLM-4-Flash never thinks
-      ...(zmodel === "glm-4.7-flash" ? { thinking: { type: manual ? "enabled" : "disabled" } } : {}),
       max_tokens: manual ? 4000 : 150,
       temperature: 0.3,
       messages: [
@@ -256,6 +285,7 @@ async function runZhipu(manual, signal, onText) {
 // One model call. Resolves {text, refused}; rejects with the backend's own error.
 async function runModel(manual, signal, onText) {
   if (!usingAccount() && settings.provider === "zhipu") return runZhipu(manual, signal, onText);
+  if (!usingAccount() && settings.provider === "ark") return runArk(manual, signal, onText);
   if (usingAccount()) {
     try {
       const { text } = await sample(systemPrompt(manual) + "\n\n" + userContent(manual), {
@@ -304,7 +334,8 @@ async function analyze(manual = false) {
     return;
   }
   if (!manual) {
-    if (state.transcript.length === state.analyzedCount) return;
+    const newPartial = state.livePartial && state.livePartial !== state.partialAnalyzed;
+    if (state.transcript.length === state.analyzedCount && !newPartial) return;
     if (Date.now() < state.autoPausedUntil) return;
     const wait = state.lastAutoAt + (usingAccount() ? 6000 : 1000) - Date.now();
     if (wait > 0) return scheduleAnalyze(wait);
@@ -322,11 +353,15 @@ async function analyze(manual = false) {
   state.inFlight = ctl;
   if (!manual) state.lastAutoAt = Date.now();
   const upTo = state.transcript.length;
+  state.partialAnalyzed = state.livePartial;
 
   setThinking(true, manual);
+  const t0 = performance.now();
+  let tFirst = 0;
   try {
     const { text, refused } = await runModel(manual, ctl.signal, (soFar) => {
       if (ctl.signal.aborted) return;
+      if (!tFirst) tFirst = performance.now();
       // don't flash anything while the reply might still turn out to be "PASS"
       if (!manual && "PASS".startsWith(soFar.trim().slice(0, 4).toUpperCase())) return;
       const a = parseAdvice(soFar, manual);
@@ -334,6 +369,8 @@ async function analyze(manual = false) {
     });
     state.analyzedCount = Math.max(state.analyzedCount, upTo);
     LS.set("usage", state.usage);
+    // how long the AI took, shown under the buttons so slowness can be pinned down
+    state.lastTiming = { first: ((tFirst || performance.now()) - t0) / 1000, total: (performance.now() - t0) / 1000 };
 
     const a = refused ? null : parseAdvice(text, manual);
     if (refused && manual) showNotice("Claude 这次没有回答，换个说法再试");
@@ -371,12 +408,14 @@ async function analyze(manual = false) {
 
 function errorText(err) {
   if (err?.zhipu) {
-    if (err.status === 401) return "智谱 API Key 无效，请到「设置」检查";
+    const who = settings.provider === "ark" ? "火山方舟" : "智谱";
+    if (err.status === 401) return `${who} API Key 无效，请到「设置」检查`;
+    if (err.status === 404) return `${who}：模型名称不对或还没开通，请到「设置」检查`;
     if (err.status === 429) {
       state.autoPausedUntil = Date.now() + 20000;
-      return "智谱免费版正在限流（下午到晚上高峰期常见），自动提醒暂停 20 秒后继续";
+      return `${who}正在限流，自动提醒暂停 20 秒后继续`;
     }
-    return `智谱出错（${err.status}${err.zcode ? " / " + err.zcode : ""}）：${(err.message || "").slice(0, 60)}`;
+    return `${who}出错（${err.status}${err.zcode ? " / " + err.zcode : ""}）：${(err.message || "").slice(0, 60)}`;
   }
   if (err instanceof TypeError) return "连不上 AI 服务器，请检查网络";
 
@@ -416,7 +455,10 @@ function scheduleAnalyze(delay = 700) {
   analyzeTimer = setTimeout(() => {
     const fresh = state.transcript.slice(state.analyzedCount);
     const chars = fresh.reduce((n, e) => n + e.text.length, 0);
-    if (chars >= settings.minChars || fresh.some((e) => e.manual)) analyze(false);
+    // don't wait for the sentence to finish: react once enough of it has been said
+    const seen = state.livePartial.startsWith(state.partialAnalyzed) ? state.partialAnalyzed.length : 0;
+    const partialGrowth = state.livePartial.length - seen;
+    if (chars >= settings.minChars || fresh.some((e) => e.manual) || partialGrowth >= 10) analyze(false);
   }, delay);
 }
 
@@ -643,7 +685,12 @@ function openStream() {
     appId: settings.dbAppId,
     token: settings.dbToken,
     resourceId: streamRes,
-    onPartial: (t) => stream === s && renderPartial(t ? t + " …" : ""),
+    onPartial: (t) => {
+      if (stream !== s) return;
+      renderPartial(t ? t + " …" : "");
+      state.livePartial = t || "";
+      if (t) scheduleAnalyze(250);
+    },
     onFinal: (t) => stream === s && commit(t),
     onError: (code, msg) => {
       if (stream !== s) return;
@@ -747,6 +794,10 @@ function commit(text, manual = false) {
   if (!text) return;
   state.transcript.push({ at: Date.now(), text, manual });
   LS.set("transcript", state.transcript.slice(-400));
+  if (!manual) {
+    state.livePartial = "";
+    state.partialAnalyzed = "";
+  }
   renderPartial("");
   renderTranscript();
   scheduleAnalyze(0);
@@ -1028,10 +1079,15 @@ function renderMeta() {
     $("#meta").textContent = `用你的 Claude 账号额度 · 已分析 ${state.usage.calls} 次`;
     return;
   }
-  if (settings.provider === "zhipu") {
-    const name = (ZHIPU_MODELS[settings.zhipuModel] || settings.zhipuModel).replace(/（.*）/, "");
+  if (settings.provider === "zhipu" || settings.provider === "ark") {
+    const name =
+      settings.provider === "ark"
+        ? "火山方舟 Doubao"
+        : "智谱 " + (ZHIPU_MODELS[settings.zhipuModel] || settings.zhipuModel).replace(/（.*）/, "");
     const asr = ASR[activeAsr()]?.name || "手机自带";
-    $("#meta").textContent = `识别：${asr} · 分析：智谱 ${name} · ${state.usage.calls} 次`;
+    const t = state.lastTiming;
+    const timing = t ? ` · 上次提醒 ${t.first.toFixed(1)}秒出字 / ${t.total.toFixed(1)}秒完成` : "";
+    $("#meta").textContent = `识别：${asr} · 分析：${name} · ${state.usage.calls} 次${timing}`;
     return;
   }
   const m = MODELS[settings.model];
@@ -1045,6 +1101,7 @@ function applyBackendUI() {
     el.hidden =
       account ||
       (el.classList.contains("p-zhipu") && prov !== "zhipu") ||
+      (el.classList.contains("p-ark") && prov !== "ark") ||
       (el.classList.contains("p-anthropic") && prov !== "anthropic");
   });
   const asr = $("#fAsr").value || settings.asr;
@@ -1077,6 +1134,8 @@ function openSheet(id) {
     $("#fProvider").value = settings.provider;
     $("#fZKey").value = settings.zhipuKey;
     $("#fZModel").value = settings.zhipuModel;
+    $("#fArkKey").value = settings.arkKey;
+    $("#fArkModel").value = settings.arkModel;
     $("#fAsr").value = settings.asr;
     $("#fSfKey").value = settings.sfKey;
     $("#fSfModel").value = settings.sfModel;
@@ -1139,6 +1198,8 @@ function init() {
     settings.provider = $("#fProvider").value;
     settings.zhipuKey = $("#fZKey").value.trim();
     settings.zhipuModel = $("#fZModel").value;
+    settings.arkKey = $("#fArkKey").value.trim();
+    settings.arkModel = $("#fArkModel").value.trim();
     settings.asr = $("#fAsr").value;
     settings.sfKey = $("#fSfKey").value.trim();
     settings.sfModel = $("#fSfModel").value;

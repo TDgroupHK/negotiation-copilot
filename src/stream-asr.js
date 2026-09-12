@@ -93,10 +93,10 @@ export class DoubaoStream {
           model_name: "bigmodel",
           enable_itn: true,
           enable_punc: true,
-          enable_nonstream: true, // re-check each finished sentence with the more accurate model
+          enable_nonstream: false, // a second, slower pass per sentence: off, speed matters more here
           show_utterances: true,
           result_type: "single",
-          end_window_size: 600, // ms of silence that ends a sentence
+          end_window_size: 500, // ms of silence that ends a sentence
         },
       };
       ws.send(packet(FULL_CLIENT_REQUEST, POS_SEQUENCE, SER_JSON, 1, new TextEncoder().encode(JSON.stringify(req))));
