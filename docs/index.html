@@ -219,10 +219,15 @@
       </select></label>
     <label class="field api-only"><span>语音识别</span>
       <select id="fAsr">
-        <option value="siliconflow">硅基流动 SenseVoice（免费，准确，推荐）</option>
+        <option value="doubao">豆包语音（最准，火山引擎）</option>
+        <option value="siliconflow">硅基流动 SenseVoice（免费，准确）</option>
         <option value="zhipu">智谱 GLM-ASR（最准，约 0.06 元/分钟，需充值）</option>
         <option value="browser">手机自带（免费，准确率低）</option>
       </select></label>
+    <label class="field api-only asr-db"><span>豆包 APP ID（火山引擎 豆包语音控制台 → 应用管理）</span>
+      <input id="fDbAppId" inputmode="numeric" placeholder="例如 1234567890" autocapitalize="off" spellcheck="false"></label>
+    <label class="field api-only asr-db"><span>豆包 Access Token（同一个应用里的 Access Token）</span>
+      <input id="fDbToken" type="password" placeholder="粘贴 Access Token" autocapitalize="off" spellcheck="false"></label>
     <label class="field api-only asr-sf"><span>硅基流动 API Key（在 cloud.siliconflow.cn 的「API 密钥」页面复制）</span>
       <input id="fSfKey" type="password" placeholder="sk-..." autocapitalize="off" spellcheck="false"></label>
     <p class="hint api-only asr-zhipu">使用上面填写的智谱 API Key，按录音时长计费。</p>

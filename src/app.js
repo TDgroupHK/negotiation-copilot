@@ -29,7 +29,9 @@ const settings = Object.assign(
     provider: "zhipu", // "zhipu" (free GLM) | "anthropic" (Claude API)
     zhipuKey: "",
     zhipuModel: "glm-4.7-flash",
-    asr: "siliconflow", // speech-to-text: "siliconflow" (free) | "zhipu" (paid) | "browser" (phone built-in)
+    asr: "doubao", // speech-to-text: "doubao" | "siliconflow" (free) | "zhipu" (paid) | "browser" (phone built-in)
+    dbAppId: "",
+    dbToken: "",
     sfKey: "",
     apiKey: "",
     baseURL: "",
@@ -400,6 +402,11 @@ function scheduleAnalyze(delay = 700) {
 // The page records each utterance itself (recorder.js) and sends it as a WAV to a
 // transcription API — far more accurate than the phone's built-in web recognition.
 const ASR = {
+  doubao: {
+    name: "豆包语音",
+    url: "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",
+    key: () => settings.dbAppId && settings.dbToken,
+  },
   siliconflow: {
     name: "硅基流动 SenseVoice",
     url: "https://api.siliconflow.cn/v1/audio/transcriptions",
@@ -424,10 +431,79 @@ function transcribeLater(blob) {
   asrChain = asrChain.then(() => transcribe(blob)).catch(() => {});
 }
 
+const blobToBase64 = (blob) =>
+  new Promise((ok, fail) => {
+    const r = new FileReader();
+    r.onload = () => ok(String(r.result).split(",")[1]);
+    r.onerror = fail;
+    r.readAsDataURL(blob);
+  });
+const uuid = () =>
+  crypto.randomUUID?.() ||
+  "10000000-1000-4000-8000-100000000000".replace(/[018]/g, (c) => (c ^ (Math.random() * 16) >> (c / 4)).toString(16));
+
+let dbNoContext = false; // set if the service ever rejects the context field
+
+// Doubao (Volcengine) flash recognition. Only the APP ID + Access Token header pair passes
+// the service's CORS rules; the newer single X-Api-Key header is blocked in browsers.
+async function transcribeDoubao(blob, retry = false) {
+  const request = { model_name: "bigmodel", enable_itn: true, enable_punc: true };
+  if (!dbNoContext) {
+    // background terms + the last few sentences help with names, numbers and jargon
+    const hints = [prep.me, prep.goal, prep.them, prep.notes, ...state.transcript.slice(-5).map((e) => e.text)]
+      .filter(Boolean)
+      .join("\n")
+      .slice(-800);
+    if (hints) request.corpus = { context: JSON.stringify({ contextData: [{ text: hints }] }) };
+  }
+  const res = await fetch(ASR.doubao.url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Api-App-Key": settings.dbAppId,
+      "X-Api-Access-Key": settings.dbToken,
+      "X-Api-Resource-Id": "volc.bigasr.auc_turbo",
+      "X-Api-Request-Id": uuid(),
+      "X-Api-Sequence": "-1",
+    },
+    body: JSON.stringify({ user: { uid: "tanpan" }, audio: { data: await blobToBase64(blob), format: "wav" }, request }),
+  });
+  const status = res.headers.get("X-Api-Status-Code") || "";
+  const json = await res.json().catch(() => ({}));
+  if (res.ok && (!status || status === "20000000")) return String(json?.result?.text || "");
+  if (status === "20000003") return ""; // silence
+  if (status.startsWith("45000") && status !== "45000010" && request.corpus && !retry) {
+    dbNoContext = true; // parameter problem: try once more without the context hints
+    return transcribeDoubao(blob, true);
+  }
+  throw { doubao: true, status: res.status, code: status, message: res.headers.get("X-Api-Message") || json?.header?.message || "" };
+}
+
 async function transcribe(blob) {
   const id = activeAsr();
   const p = ASR[id];
   if (!p || asrFailed) return;
+  if (id === "doubao") {
+    if (state.listening) renderLive("识别中…");
+    try {
+      const text = (await transcribeDoubao(blob)).trim();
+      if (text) commit(text);
+      else if (state.listening) renderLive("");
+    } catch (err) {
+      if (!err?.doubao) {
+        showNotice("语音识别连不上服务器，请检查网络");
+      } else if (err.code === "45000010" || err.status === 401) {
+        asrFailed = true;
+        stopListening();
+        showNotice("豆包语音的 APP ID 或 Access Token 不对，请到「设置」检查");
+      } else if (err.status === 403 || err.status === 429) {
+        showNotice(`豆包语音：${err.message || "额度用完或请求太频繁"}（${err.code || err.status}）`);
+      } else {
+        showNotice(`豆包语音出错（${err.code || err.status}）：${err.message.slice(0, 60)}`);
+      }
+    }
+    return;
+  }
   const fd = new FormData();
   fd.append("model", p.model);
   fd.append("file", blob, "speech.wav");
@@ -800,6 +876,7 @@ function applyBackendUI() {
       (el.classList.contains("p-anthropic") && prov !== "anthropic");
   });
   const asr = $("#fAsr").value || settings.asr;
+  document.querySelectorAll(".asr-db").forEach((el) => (el.hidden = asr !== "doubao"));
   document.querySelectorAll(".asr-sf").forEach((el) => (el.hidden = asr !== "siliconflow"));
   document.querySelectorAll(".asr-zhipu").forEach((el) => (el.hidden = asr !== "zhipu"));
   document.querySelectorAll(".asr-browser").forEach((el) => (el.hidden = asr !== "browser"));
@@ -830,6 +907,8 @@ function openSheet(id) {
     $("#fZModel").value = settings.zhipuModel;
     $("#fAsr").value = settings.asr;
     $("#fSfKey").value = settings.sfKey;
+    $("#fDbAppId").value = settings.dbAppId;
+    $("#fDbToken").value = settings.dbToken;
     applyBackendUI();
     $("#fKey").value = settings.apiKey;
     $("#fBase").value = settings.baseURL;
@@ -889,6 +968,8 @@ function init() {
     settings.zhipuModel = $("#fZModel").value;
     settings.asr = $("#fAsr").value;
     settings.sfKey = $("#fSfKey").value.trim();
+    settings.dbAppId = $("#fDbAppId").value.trim();
+    settings.dbToken = $("#fDbToken").value.trim();
     asrFailed = false;
     settings.apiKey = $("#fKey").value.trim();
     settings.baseURL = $("#fBase").value.trim();
