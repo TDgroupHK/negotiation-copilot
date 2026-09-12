@@ -5,12 +5,22 @@ const RATE = 16000;
 const FRAME = 320; // 20 ms at 16 kHz
 
 export class SegmentRecorder {
-  constructor({ onSegment, onState, onLevel, silenceMs = 700, maxMs = 25000, minSpeechMs = 400, prerollMs = 300 }) {
+  constructor({
+    onSegment,
+    onState,
+    onLevel,
+    silenceMs = 600,
+    softMs = 8000, // after this long, cut at the next dip in the voice
+    maxMs = 15000, // never let one piece run longer than this
+    minSpeechMs = 400,
+    prerollMs = 300,
+  }) {
     this.onSegment = onSegment;
     this.onState = onState || (() => {});
     this.onLevel = onLevel || (() => {});
     this.frames = 0;
     this.silenceFrames = silenceMs / 20;
+    this.softFrames = softMs / 20;
     this.maxFrames = maxMs / 20;
     this.minSpeechFrames = minSpeechMs / 20;
     this.prerollFrames = prerollMs / 20;
@@ -35,7 +45,7 @@ export class SegmentRecorder {
     this.srcPos = 0; // fractional read position for resampling
     this.pending = new Float32Array(0); // resampled samples not yet framed
 
-    this.noise = 0.005;
+    this.recent = []; // frame levels of the last ~2 s
     this.preroll = [];
     this.segment = null; // {frames: [], loud: n, quiet: n}
     this.loudRun = 0;
@@ -63,14 +73,17 @@ export class SegmentRecorder {
   // resample to 16 kHz (linear interpolation), then process 20 ms frames
   feed(input) {
     const out = [];
+    // pos can start in [-1, 0): between the previous chunk's last sample and input[0]
     let pos = this.srcPos;
+    const prev = this.lastSample || 0;
     while (pos < input.length - 1) {
       const i = Math.floor(pos);
       const f = pos - i;
-      out.push(input[i] * (1 - f) + input[i + 1] * f);
+      out.push((i < 0 ? prev : input[i]) * (1 - f) + input[i + 1] * f);
       pos += this.ratio;
     }
     this.srcPos = pos - input.length;
+    this.lastSample = input[input.length - 1];
     const merged = new Float32Array(this.pending.length + out.length);
     merged.set(this.pending);
     merged.set(out, this.pending.length);
@@ -83,33 +96,48 @@ export class SegmentRecorder {
     let sum = 0;
     for (let i = 0; i < f.length; i++) sum += f[i] * f[i];
     const rms = Math.sqrt(sum / f.length);
-    const threshold = Math.max(this.noise * 2.2, 0.003);
-    const loud = rms > threshold;
-    if (++this.frames % 10 === 0) this.onLevel(rms, !!this.segment); // ~5 times a second
+    if (!Number.isFinite(rms)) return; // never let one bad frame poison the levels
 
-    if (!this.segment) {
-      // track the background noise level only while nobody is talking
-      if (!loud) this.noise = this.noise * 0.98 + rms * 0.02;
+    // Background level = the quietest moment of the last ~2 s. iOS boosts room noise
+    // (auto gain), so a fixed threshold never sees a pause; this follows it instead.
+    this.recent.push(rms);
+    if (this.recent.length > 100) this.recent.shift();
+    const floor = Math.min(...this.recent);
+    const base = Math.max(floor * 3, 0.003);
+
+    const s = this.segment;
+    if (++this.frames % 10 === 0) this.onLevel(rms, s ? s.frames.length / 50 : 0); // ~5 times a second
+
+    if (!s) {
       this.preroll.push(f);
       if (this.preroll.length > this.prerollFrames) this.preroll.shift();
-      this.loudRun = loud ? this.loudRun + 1 : 0;
+      this.loudRun = rms > base ? this.loudRun + 1 : 0;
       if (this.loudRun >= 3) {
-        this.segment = { frames: this.preroll.slice(), loud: this.loudRun, quiet: 0 };
+        this.segment = { frames: this.preroll.slice(), loud: this.loudRun, quiet: 0, voice: Math.max(rms, base * 2) };
         this.preroll = [];
         this.onState("speaking");
       }
       return;
     }
 
-    const s = this.segment;
     s.frames.push(f);
-    if (loud) {
+    // a pause = clearly quieter than this speaker's own voice, not just below a fixed level
+    const quietBelow = Math.max(base, s.voice * 0.3);
+    if (rms > quietBelow) {
       s.loud++;
       s.quiet = 0;
+      s.voice = s.voice * 0.9 + rms * 0.1;
     } else {
       s.quiet++;
     }
-    if (s.quiet >= this.silenceFrames || s.frames.length >= this.maxFrames) this.finish(false);
+    const len = s.frames.length;
+    if (
+      s.quiet >= this.silenceFrames ||
+      (len >= this.softFrames && rms < s.voice * 0.45) || // long stretch: cut at a dip
+      len >= this.maxFrames
+    ) {
+      this.finish(false);
+    }
   }
 
   finish(final) {

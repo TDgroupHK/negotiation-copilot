@@ -565,7 +565,8 @@ async function startCloudListening() {
   let lastLevel = 0;
   const rec = new SegmentRecorder({
     onSegment: transcribeLater,
-    onLevel: (rms, speaking) => {
+    onLevel: (rms, speakingSec) => {
+      const speaking = speakingSec > 0;
       if (!state.listening || recorder !== rec) return;
       lastLevel = Date.now();
       // a small meter so it's obvious the phone is hearing something
@@ -573,7 +574,8 @@ async function startCloudListening() {
       const n = Math.max(0, Math.min(7, Math.round(Math.log10(Math.max(rms, 1e-4) / 1e-3) * 3.5)));
       const meter = bars.slice(0, n + 1);
       const last = state.transcript.slice(-1)[0]?.text || "";
-      renderLive(`${asrBusy ? "识别中" : speaking ? "正在听" : "在听"} ${meter}${last ? "　" + last : ""}`);
+      const label = speaking ? `正在听 ${Math.floor(speakingSec)}秒` : asrBusy ? "识别中" : "在听";
+      renderLive(`${label} ${meter}${last ? "　" + last : ""}`);
     },
   });
   recorder = rec;
